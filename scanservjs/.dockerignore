@@ -1,0 +1,11 @@
+# Ignore everything except what we need
+*
+
+# But include these files
+!Dockerfile
+!post-scan.sh
+!smb-handler.sh
+!email-handler.sh
+!file-watcher.sh
+!entrypoint.sh
+

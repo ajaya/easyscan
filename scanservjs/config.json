@@ -15,7 +15,14 @@
     {"name": "Letter", "width": 215.9, "height": 279.4},
     {"name": "Legal", "width": 215.9, "height": 355.6},
     {"name": "A4", "width": 210, "height": 297},
-    {"name": "A5", "width": 148, "height": 210}
+    {"name": "A5", "width": 148, "height": 210},
+    {"name": "A3", "width": 297, "height": 420},
+    {"name": "B4", "width": 250, "height": 353},
+    {"name": "B5", "width": 176, "height": 250},
+    {"name": "Executive", "width": 184.2, "height": 266.7},
+    {"name": "Folio", "width": 210, "height": 330},
+    {"name": "Quarto", "width": 215, "height": 275},
+    {"name": "Tabloid", "width": 279.4, "height": 431.8}
   ],
   "scanModes": [
     {
@@ -32,6 +39,41 @@
       "id": "lineart",
       "name": "Black & White",
       "mode": "Lineart"
+    }
+  ],
+  "sources": [
+    {
+      "id": "platen",
+      "name": "Platen (Flatbed)",
+      "source": "Flatbed"
+    },
+    {
+      "id": "adf",
+      "name": "ADF (Automatic Document Feeder)",
+      "source": "ADF"
+    },
+    {
+      "id": "adf-simplex",
+      "name": "ADF Simplex (Single-sided)",
+      "source": "ADF"
+    },
+    {
+      "id": "adf-duplex",
+      "name": "ADF Duplex (Double-sided)",
+      "source": "ADF",
+      "duplex": true
+    }
+  ],
+  "duplexModes": [
+    {
+      "id": "simplex",
+      "name": "Simplex (Single-sided)",
+      "duplex": false
+    },
+    {
+      "id": "duplex",
+      "name": "Duplex (Double-sided)",
+      "duplex": true
     }
   ]
 }

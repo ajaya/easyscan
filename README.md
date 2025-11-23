@@ -7,6 +7,205 @@ This setup allows you to share an Epson ES-400 scanner (or other SANE-compatible
 - **Web Interface** (ScanServJS) - Access from any browser
 - **AirScan/eSCL** - Native support in macOS and Windows 10/11
 - **SANE Network Protocol** - For Linux and SANE-compatible clients
+- **SMB Network Share Output** - Automatically copy scans to network shares
+- **Email Output** - Automatically email scans as attachments
+- **Advanced Scanner Options** - Paper sizes, duplex, ADF/platen source selection
+
+## System Architecture
+
+### Physical Topology
+
+```mermaid
+graph TB
+    Scanner[USB Scanner<br/>Epson ES-400]
+    Pi[Raspberry Pi<br/>IP: 192.168.1.100]
+    
+    subgraph Docker["Docker Host (network_mode: host)"]
+        Saned[saned<br/>Port: 6566<br/>Direct USB Access]
+        Airsane[airsane<br/>Port: 8090]
+        Scanservjs[scanservjs<br/>Port: 8080]
+    end
+    
+    Mac[macOS Client]
+    Win[Windows Client]
+    Linux[Linux Client]
+    
+    Scanner -->|USB Cable| Pi
+    Pi --> Docker
+    Docker --> Saned
+    Docker --> Airsane
+    Docker --> Scanservjs
+    
+    Saned -->|Direct USB| Scanner
+    Airsane -->|SANE Network Protocol| Saned
+    Scanservjs -->|SANE Network Protocol| Saned
+    
+    Pi -->|Network| Mac
+    Pi -->|Network| Win
+    Pi -->|Network| Linux
+```
+
+### Network Topology & Port Mapping
+
+```mermaid
+graph TB
+    subgraph Pi["Raspberry Pi (192.168.1.100)"]
+        subgraph Scanservjs["scanservjs Container"]
+            S1[Protocol: HTTP/HTTPS<br/>Port: 8080:8080<br/>Network: Bridge]
+        end
+        subgraph Airsane["airsane Container"]
+            A1[Protocol: AirScan/eSCL<br/>Port: 8090<br/>Network: Host<br/>mDNS: Auto-discovery]
+        end
+        subgraph Saned["saned Container"]
+            N1[Protocol: SANE Network<br/>Port: 6566<br/>Network: Host<br/>Access Control: ALLOWED_NETWORK]
+        end
+    end
+    
+    Mac[macOS Client<br/>Port: 8080 HTTP]
+    Win[Windows Client<br/>Port: 8090 eSCL]
+    Linux[Linux Client<br/>Port: 6566 SANE]
+    
+    Mac -->|http://192.168.1.100:8080| S1
+    Win -->|mDNS Discovery| A1
+    Linux -->|scanimage -d net:192.168.1.100:6566| N1
+```
+
+### Port & Protocol Summary
+
+| Service    | Protocol      | Port | Network Mode | Access Method                    |
+|------------|---------------|------|--------------|----------------------------------|
+| scanservjs  | HTTP/HTTPS    | 8080 | Bridge       | Browser: `http://PI_IP:8080`    |
+| airsane    | AirScan/eSCL  | 8090 | Host         | Auto-discovery (mDNS/Bonjour)    |
+| saned      | SANE Network  | 6566 | Host         | `scanimage -d net:PI_IP:6566`    |
+
+### Data Flow: How Scanning Works
+
+#### 1. Web Interface (ScanServJS)
+
+```mermaid
+sequenceDiagram
+    participant Browser as Client Browser
+    participant Scanservjs as scanservjs:8080
+    participant Saned as saned:6566
+    participant Scanner as USB Scanner
+    participant Data as scanservjs/data
+    participant Watcher as File Watcher<br/>(inotify)
+    participant SMB as SMB Handler
+    participant Email as Email Handler
+    
+    Browser->>Scanservjs: HTTP Request (Scan)
+    Scanservjs->>Saned: SANE Network Protocol<br/>localhost:6566
+    Saned->>Scanner: /dev/bus/usb
+    Scanner-->>Saned: Scan Data
+    Saned-->>Scanservjs: Image Data
+    Scanservjs->>Data: Save to disk
+    Scanservjs-->>Browser: HTTP Response (Download/Preview)
+    
+    Note over Data,Watcher: Post-Processing (if enabled)
+    Data->>Watcher: File created event
+    Watcher->>SMB: Copy to SMB share (if enabled)
+    Watcher->>Email: Send via email (if enabled)
+```
+
+#### 2. AirScan/eSCL (macOS/Windows)
+
+```mermaid
+sequenceDiagram
+    participant Client as macOS/Windows Client
+    participant Network as Network (mDNS)
+    participant Airsane as airsane:8090
+    participant Saned as saned:6566
+    participant Scanner as USB Scanner
+    
+    Client->>Network: 1. mDNS Discovery<br/>(Bonjour/Zeroconf)
+    Network-->>Client: Scanner appears in<br/>System Settings
+    Client->>Airsane: 2. eSCL Protocol<br/>HTTP POST /eSCL/Scan
+    Airsane->>Saned: 3. SANE Network Protocol<br/>localhost:6566
+    Saned->>Scanner: /dev/bus/usb
+    Scanner-->>Saned: Scan Data
+    Saned-->>Airsane: Image Data
+    Airsane-->>Client: 4. Receives PDF
+```
+
+#### 3. SANE Network Protocol (Linux)
+
+```mermaid
+sequenceDiagram
+    participant Client as Linux Client
+    participant Network as Network (TCP)
+    participant Saned as saned:6566
+    participant SANE as SANE Backend (epson2)
+    participant Scanner as USB Scanner
+    
+    Client->>Network: 1. Connect to SANE daemon<br/>scanimage -d net:192.168.1.100:6566
+    Network->>Saned: TCP Connection<br/>Port: 6566<br/>Access Control Check
+    Note over Saned: Client IP in<br/>ALLOWED_NETWORK?
+    Saned->>SANE: 2. SANE Protocol<br/>(Binary protocol)
+    SANE->>Scanner: 3. SANE Backend<br/>/dev/bus/usb
+    Scanner-->>SANE: Scan Data
+    SANE-->>Saned: Image Data
+    Saned-->>Network: Scan Data
+    Network-->>Client: 4. Receives Image
+```
+
+### Container Communication
+
+All three containers share the same USB device simultaneously:
+
+```mermaid
+graph TB
+    USB[Host: /dev/bus/usb<br/>USB Device Bus]
+    
+    subgraph Containers["Docker Containers"]
+        Saned[saned<br/>Privileged Mode: ON<br/>Direct USB Access]
+        Airsane[airsane<br/>Network Mode: Host]
+        Scanservjs[scanservjs<br/>Network Mode: Bridge]
+    end
+    
+    Scanner[USB Scanner<br/>Epson]
+    
+    USB -->|Volume Mount| Saned
+    Saned -->|SANE Network Protocol<br/>localhost:6566| Airsane
+    Saned -->|SANE Network Protocol<br/>localhost:6566| Scanservjs
+    
+    Saned -->|Direct USB| Scanner
+    
+    Note1["saned handles device locking<br/>(only one scan at a time)"]
+    Scanner -.->|Locking| Note1
+```
+
+**Key Points:**
+- Only `saned` container has direct USB access (`privileged: true`, mounts `/dev/bus/usb`)
+- `airsane` and `scanservjs` connect to `saned` via SANE Network Protocol (localhost:6566)
+- `saned` acts as the central SANE daemon, managing all scanner access
+- `saned` handles device locking (only one scan at a time)
+- This architecture centralizes scanner control and simplifies access management
+
+### Network Access Control
+
+```mermaid
+flowchart TD
+    Client[Client Network: 192.168.1.0/24<br/>Client IP: 192.168.1.50]
+    Attempt[Connection Attempt]
+    Saned[saned Container<br/>Checks /etc/sane.d/saned.conf]
+    Check{ALLOWED_NETWORK<br/>192.168.0.0/16<br/>Covers 192.168.1.50?}
+    Granted[✓ Access Granted]
+    Scanner[USB Scanner]
+    
+    Client --> Attempt
+    Attempt --> Saned
+    Saned --> Check
+    Check -->|Yes| Granted
+    Check -->|No| Denied[✗ Access Denied]
+    Granted --> Scanner
+    Scanner --> Scan[Scan Request Proceeds]
+```
+
+**Access Control Rules:**
+- `ALLOWED_NETWORK`: Primary network range (required)
+- `SECONDARY_NETWORK`: Additional networks (optional)
+- Only applies to `saned` (SANE Network Protocol)
+- `scanservjs` and `airsane` use their own access controls
 
 ## Quick Start
 
@@ -37,6 +236,126 @@ This setup allows you to share an Epson ES-400 scanner (or other SANE-compatible
    - macOS Image Capture: Scanner appears automatically
    - Windows Scan: Scanner appears automatically
 
+## How to Scan
+
+### Method 1: Web Interface (Any Device)
+
+**Steps:**
+1. Open browser on any device (computer, tablet, phone)
+2. Navigate to: `http://[PI_IP]:8080`
+   - Replace `[PI_IP]` with your Raspberry Pi's IP address
+   - Example: `http://192.168.1.100:8080`
+3. Select your scanner from the device list
+4. Configure scan settings:
+   - **Paper Size**: Letter (default), Legal, A4, A5, or custom dimensions
+   - **Source**: ADF Simplex (default), ADF Duplex, or Platen (Flatbed)
+   - **Color Mode**: Color, Grayscale, or Black & White
+   - **Resolution**: Adjustable DPI setting
+5. Click "Scan" button
+6. Download or preview the scanned document
+7. File is automatically processed:
+   - Saved to `scanservjs/data/` directory
+   - Copied to SMB share (if enabled)
+   - Sent via email (if enabled)
+
+**Data Flow:**
+```
+Browser → HTTP → scanservjs:8080 → SANE → USB Scanner → scanservjs/data → Browser
+```
+
+**Output:** 
+- Files saved in `scanservjs/data/` directory on Pi, downloadable via browser
+- Optionally copied to SMB network share (if configured)
+- Optionally sent via email (if configured)
+
+### Method 2: macOS Image Capture / Preview
+
+**Steps:**
+1. Open **Image Capture** (Applications > Image Capture) or **Preview**
+2. Scanner should appear automatically in device list
+   - If not visible, wait 30-60 seconds for mDNS discovery
+   - Check network connection to Pi
+3. Select scanner from sidebar
+4. Configure scan settings in Image Capture
+5. Click "Scan" button
+6. Image appears in Preview or chosen destination
+
+**Data Flow:**
+```
+macOS → mDNS Discovery → airsane:8090 → eSCL Protocol → SANE → USB Scanner → macOS
+```
+
+**Output:** Directly to macOS (Preview, folder, or app of choice)
+
+### Method 3: Windows Scan App
+
+**Steps:**
+1. Open **Windows Scan** app (built into Windows 10/11)
+   - Or: Settings > Devices > Printers & scanners > Add device
+2. Scanner should appear automatically
+   - If not, click "Add device" and wait for discovery
+3. Select scanner from list
+4. Configure scan settings (color, resolution, file type)
+5. Click "Scan" button
+6. Choose save location
+
+**Data Flow:**
+```
+Windows → mDNS Discovery → airsane:8090 → eSCL Protocol → SANE → USB Scanner → Windows
+```
+
+**Output:** Directly to Windows (chosen folder or app)
+
+### Method 4: Linux SANE Network Protocol
+
+**Prerequisites:**
+- Install SANE on client: `sudo apt-get install sane sane-utils` (Debian/Ubuntu)
+- Or: `sudo yum install sane-backends sane-backends-drivers-scanners` (RHEL/CentOS)
+
+**Steps:**
+1. Configure SANE to use network scanner:
+   ```bash
+   # Add to /etc/sane.d/net.conf on client
+   echo "192.168.1.100" | sudo tee -a /etc/sane.d/net.conf
+   ```
+   Replace `192.168.1.100` with your Pi's IP address
+
+2. Test scanner detection:
+   ```bash
+   scanimage -L
+   # Should show: device `net:192.168.1.100:6566:epson2:libusb:001:003' is a ...
+   ```
+
+3. Scan to file:
+   ```bash
+   # Scan to PPM file
+   scanimage -d net:192.168.1.100:6566 --format=ppm > scan.ppm
+   
+   # Scan with options
+   scanimage -d net:192.168.1.100:6566 \
+     --mode Color \
+     --resolution 300 \
+     --format=png > scan.png
+   ```
+
+4. Use with scanning applications:
+   - **XSane**: `xsane net:192.168.1.100:6566`
+   - **Simple Scan**: Should auto-detect network scanner
+   - **gscan2pdf**: Select network scanner from device list
+
+**Data Flow:**
+```
+Linux Client → TCP:6566 → saned → SANE Protocol → USB Scanner → TCP:6566 → Linux Client
+```
+
+**Output:** Directly to client (file or application)
+
+**Troubleshooting Linux SANE:**
+- Verify network access: `telnet 192.168.1.100 6566` (should connect)
+- Check firewall: Ensure port 6566 is open
+- Verify ALLOWED_NETWORK in `.env` includes client's network
+- Test with verbose mode: `scanimage -d net:192.168.1.100:6566 -v`
+
 ## Commands
 
 - `./start.sh` - Start all services
@@ -63,7 +382,14 @@ SCAN/
 │   ├── saned.conf          # Network access control (template)
 │   └── dll.conf            # SANE backend selection
 ├── scanservjs/             # Web interface configs
+│   ├── Dockerfile          # Custom scanservjs image (SMB/email support)
 │   ├── config.json         # ScanServJS configuration
+│   ├── config.local.js     # Local config (defaults: Letter, ADF Simplex)
+│   ├── post-scan.sh        # Post-scan orchestrator script
+│   ├── smb-handler.sh      # SMB network share handler
+│   ├── email-handler.sh    # Email sending handler
+│   ├── file-watcher.sh     # File system event watcher (inotify)
+│   ├── entrypoint.sh       # Custom entrypoint
 │   └── data/               # Scanned files (gitignored)
 └── airsane/                # AirScan configs
     └── airsane.conf        # AirSane configuration
@@ -77,6 +403,11 @@ SCAN/
 - **Configurable Scanner Brand**: Support for different scanner brands via `SCANNER_BRAND` variable
 - **Pinned Versions**: Docker images use specific versions for stability
 - **Graceful Shutdown**: Services stop gracefully, allowing active scans to complete
+- **SMB Network Share**: Automatic copying of scans to SMB/CIFS network shares
+- **Email Output**: Automatic email delivery of scanned documents
+- **File System Monitoring**: Uses inotify for real-time file event detection (no polling)
+- **Modular Post-Processing**: Separate handlers for SMB and email (easy to extend)
+- **Scanner Options**: Configurable paper sizes, color modes, duplex, and source (ADF/platen)
 
 ## Customization
 
@@ -86,7 +417,56 @@ All settings can be configured in the `.env` file. The file contains inline inst
 
 **`ALLOWED_NETWORK`** (Required) - Set this to your local network range in CIDR notation (e.g., `192.168.0.0/16`, `192.168.1.0/24`). This controls which networks can access the scanner via SANE network protocol.
 
-For all other settings, including ports, scanner brand, debug levels, and timezone, see the `.env` file for detailed instructions and default values.
+For all other settings, including ports, scanner brand, debug levels, timezone, SMB share, and email configuration, see the `.env` file for detailed instructions and default values.
+
+### ScanServJS Output Destinations
+
+ScanServJS supports multiple output destinations for scanned files:
+
+#### SMB Network Share
+Configure in `.env`:
+- `SMB_ENABLED=true` - Enable SMB copying
+- `SMB_SERVER` - SMB server address (e.g., `192.168.1.10` or `fileserver.example.com`)
+- `SMB_SHARE` - Share name (e.g., `scans` or `shared/scans`)
+- `SMB_USER` - Username for authentication
+- `SMB_PASS` - Password for authentication
+- `SMB_DOMAIN` - Domain (optional, for Windows domain authentication)
+
+**How it works:**
+- SMB share is mounted once and reused across scans
+- Automatically detects and recovers from stale mounts
+- Files are copied immediately after scanning completes
+
+#### Email Output
+Configure in `.env`:
+- `EMAIL_ENABLED=true` - Enable email sending
+- `SMTP_SERVER` - SMTP server address (e.g., `smtp.gmail.com`)
+- `SMTP_PORT` - SMTP port (default: `587` for TLS)
+- `SMTP_USER` - SMTP username
+- `SMTP_PASS` - SMTP password
+- `EMAIL_FROM` - Sender email address
+- `EMAIL_TO` - Recipient email address
+- `EMAIL_SUBJECT` - Email subject prefix
+
+**How it works:**
+- Scanned files are sent as email attachments
+- Supports both sendmail and Python SMTP methods
+- Automatic fallback if one method is unavailable
+
+### ScanServJS Scanner Options
+
+The web interface supports configurable scanner options:
+
+- **Paper Sizes**: Letter, Legal, A4, A5, A3, B4, B5, Executive, Folio, Quarto, Tabloid
+- **Color Modes**: Color, Grayscale, Black & White (Lineart)
+- **Duplex**: Simplex (single-sided) or Duplex (double-sided)
+- **Source**: Platen (Flatbed) or ADF (Automatic Document Feeder)
+
+**Default Settings:**
+- Paper Size: **Letter** (configured in `scanservjs/config.local.js`)
+- Source: **ADF Simplex** (configured in `scanservjs/config.local.js`)
+
+To change defaults, edit `scanservjs/config.local.js` and rebuild the container.
 
 ## Troubleshooting
 
