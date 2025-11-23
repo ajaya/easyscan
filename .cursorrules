@@ -1,0 +1,227 @@
+# SCAN Server - Cursor Rules
+
+## Project Overview
+
+This is a Docker-based scanner sharing system that exposes a single USB scanner through three protocols simultaneously:
+- **SANE Network Protocol** (saned container) - For Linux clients
+- **AirScan/eSCL Protocol** (airsane container) - For macOS/Windows native scanning
+- **Web Interface** (scanservjs container) - Browser-based scanning with post-processing
+
+## Architecture Principles
+
+### Multi-Container USB Sharing Pattern
+- All three containers access the same USB scanner via `/dev/bus/usb` volume mount
+- Each container uses `privileged: true` for USB access
+- SANE handles device locking (only one scan at a time)
+- `saned` is the central daemon; `airsane` and `scanservjs` connect via SANE Network Protocol (localhost:6566)
+- All services use healthchecks (`scanimage -L`) with 40s start period
+
+### Network Configuration
+- `saned` and `airsane` use `network_mode: host` for direct network access
+- `scanservjs` uses bridge network with port mapping (`${SCANSERVJS_PORT:-8080}:8080`)
+- Network access control via `ALLOWED_NETWORK` in `.env` (CIDR notation) - only applies to saned
+- Ports: scanservjs (8080), airsane (8090), saned (6566)
+
+### Configuration Management
+- All configuration via `.env` file (currently tracked in git - be careful with secrets)
+- Runtime config injection: `saned` uses `envsubst` to inject `.env` variables into `saned.conf` at startup
+- Default values use `${VAR:-default}` syntax in docker-compose.yml
+- Required variables: `ALLOWED_NETWORK`, `SCANSERVJS_PORT`, `AIRSANE_PORT`, `SANED_PORT`
+
+## Development Patterns
+
+### Docker Images
+
+**saned (Custom Build)**
+- Base: `debian:bookworm-slim`
+- Location: `saned/Dockerfile`
+- Pre-installs SANE packages during build (not runtime)
+- Uses `envsubst` at startup to inject `.env` into `saned.conf`
+- Command: `saned -l -b 0.0.0.0 -d ${SANE_DEBUG_LEVEL}`
+- Only `epson2` backend enabled in `dll.conf` (performance - don't enable unnecessary backends)
+
+**scanservjs (Custom Build)**
+- Base: `sbs20/scanservjs:latest`
+- Location: `scanservjs/Dockerfile`
+- Adds: `cifs-utils`, `python3`, `mailutils`, `inotify-tools`
+- Custom entrypoint runs both scanservjs AND file-watcher.sh in parallel
+- File watcher monitors `/app/data/output` for new scans using inotify
+- Post-processing: SMB copying and/or email delivery
+
+**airsane (Pre-built)**
+- Image: `aguslr/airsane:latest`
+- Mounts local `airsane/airsane.conf` for configuration
+- Provides eSCL/AirScan protocol with mDNS discovery
+
+### Post-Processing Architecture (scanservjs)
+
+```
+entrypoint.sh (PID 1)
+├── scanservjs (PID 2) - Web UI on port 8080
+└── file-watcher.sh (PID 3) - inotifywait on /app/data/output
+    └── post-scan.sh (triggered on new files)
+        ├── smb-handler.sh (if SMB_ENABLED=true)
+        └── email-handler.sh (if EMAIL_ENABLED=true)
+```
+
+**Key Files:**
+- `scanservjs/entrypoint.sh`: Custom entrypoint starting both services
+- `scanservjs/file-watcher.sh`: Uses inotifywait (no polling)
+- `scanservjs/post-scan.sh`: Orchestrates handlers
+- `scanservjs/smb-handler.sh`: Mounts SMB/CIFS and copies files
+- `scanservjs/email-handler.sh`: Sends via SMTP
+- `scanservjs/config.local.js`: UI defaults (Letter paper, ADF Simplex)
+
+### Shell Scripts
+
+**start.sh**
+- Validates required environment variables
+- Checks USB scanner detection (can skip with `--skip-check` or `--force`)
+- Builds custom images if needed
+- Starts all services
+- Safe `.env` loading (handles spaces/special chars)
+- Non-interactive mode detection
+
+**stop.sh**
+- Graceful shutdown (allows active scans to complete)
+
+**status.sh**
+- Checks service status and scanner detection
+
+### Testing & Debugging
+
+**Scanner Detection:**
+```bash
+docker exec saned scanimage -L      # Test SANE daemon
+docker exec airsane scanimage -L    # Test AirSane
+docker exec scanservjs scanimage -L # Test web interface
+```
+
+**Debug Mode:**
+- Set `SANE_DEBUG_LEVEL=128` in `.env` for verbose logging
+- Affects all containers via `SANE_DEBUG_DLL` and `SANE_DEBUG_EPSON2` env vars
+- `saned` outputs configuration to logs on startup
+
+**Post-Processing Testing:**
+```bash
+# Manual trigger
+docker exec scanservjs /app/post-scan.sh /app/data/output/test.pdf
+
+# Check logs
+docker-compose logs -f scanservjs
+```
+
+**Health Checks:**
+- All services: `scanimage -L` every 30s
+- Check status: `docker-compose ps`
+- Start period: 40s (don't worry about "unhealthy" immediately after start)
+
+## Code Style & Best Practices
+
+### Bash Scripts
+- Use `set -euo pipefail` for strict error handling
+- Validate required parameters before use
+- Use `[[ ]]` for conditionals (not `[ ]`)
+- Quote variables: `"${VAR:-default}"`
+- Handle non-interactive mode (check `[[ -t 0 ]]`)
+
+### Docker
+- Use specific image versions when possible (not `latest` unless necessary)
+- Healthchecks for all services
+- Graceful shutdown with `exec` in CMD/ENTRYPOINT
+- Build-time package installation (not runtime) for performance
+- Use `.dockerignore` to reduce build context
+
+### Configuration
+- All defaults in docker-compose.yml using `${VAR:-default}` syntax
+- Document all variables in `.env` with inline comments
+- Runtime injection for dynamic config (envsubst pattern)
+- Separate handlers for modular post-processing
+
+### SANE Backend Selection
+- **Critical**: Only enable the backend you need in `saned/dll.conf`
+- Every enabled backend is probed during `scanimage -L` (slows detection)
+- Currently only `epson2` enabled
+- Don't enable `net`, `pixma`, `hp`, etc. unless needed
+
+## Common Tasks
+
+### Adding Support for Different Scanners
+1. Identify backend (epson2, pixma, hp, etc.)
+2. Enable in `saned/dll.conf` (only what you need)
+3. Update `SCANNER_BRAND` in `.env`
+4. Restart: `./stop.sh && ./start.sh`
+
+### Modifying ScanServJS UI Defaults
+1. Edit `scanservjs/config.local.js`
+2. Rebuild: `docker-compose build scanservjs && docker-compose up -d scanservjs`
+
+### Changing Network Access
+1. Update `ALLOWED_NETWORK` or `SECONDARY_NETWORK` in `.env`
+2. Restart: `./stop.sh && ./start.sh` (no rebuild needed - envsubst pattern)
+
+### Enabling Post-Processing
+1. Set `SMB_ENABLED=true` or `EMAIL_ENABLED=true` in `.env`
+2. Configure SMB_* or SMTP_*/EMAIL_* variables
+3. Restart: `./stop.sh && ./start.sh`
+
+## Common Pitfalls
+
+1. **`.env` is tracked in git** - Line 2 in `.gitignore` is commented out. Uncomment if adding secrets.
+2. **SMB credentials in logs** - `SMB_PASS` appears in env vars. Avoid `docker inspect` in public reports.
+3. **Backend performance** - Adding backends to `dll.conf` slows scanner detection. Only enable what you need.
+4. **Healthcheck failures** - 40s start period is normal. Don't worry about "unhealthy" immediately after start.
+5. **File watcher not triggering** - Check container logs for inotify errors. Verify `/app/data/output` exists.
+6. **Config changes not applied** - Most `.env` changes only need restart, but `config.local.js` requires rebuild.
+
+## File Structure
+
+```
+SCAN/
+├── .env                    # Environment variables (tracked in git)
+├── docker-compose.yml      # Service definitions with health checks
+├── start.sh                # Start script (with --skip-check option)
+├── stop.sh                 # Stop script (graceful shutdown)
+├── status.sh               # Status check script
+├── saned/                  # SANE daemon configs
+│   ├── Dockerfile          # Custom saned image
+│   ├── saned.conf          # Network access control (template)
+│   └── dll.conf            # SANE backend selection
+├── scanservjs/             # Web interface configs
+│   ├── Dockerfile          # Custom scanservjs image
+│   ├── config.json         # ScanServJS configuration
+│   ├── config.local.js     # Local config (defaults)
+│   ├── post-scan.sh        # Post-scan orchestrator
+│   ├── smb-handler.sh      # SMB network share handler
+│   ├── email-handler.sh    # Email sending handler
+│   ├── file-watcher.sh     # File system event watcher (inotify)
+│   ├── entrypoint.sh       # Custom entrypoint
+│   └── data/               # Scanned files (gitignored)
+└── airsane/                # AirScan configs
+    └── airsane.conf        # AirSane configuration
+```
+
+## When Making Changes
+
+### Docker Images
+- Custom images (saned, scanservjs) require rebuild: `docker-compose build [service]`
+- Pre-built images (airsane) only need restart: `./stop.sh && ./start.sh`
+
+### Configuration Files
+- `.env` changes: Restart only (envsubst pattern handles injection)
+- `config.local.js`: Requires rebuild of scanservjs container
+- `saned.conf`, `dll.conf`: Requires rebuild of saned container
+- `airsane.conf`: Restart only (mounted as volume)
+
+### Scripts
+- Shell scripts: Restart containers to pick up changes
+- Entrypoint changes: Rebuild container
+
+## Documentation
+
+- **README.md**: User-facing documentation (setup, usage, troubleshooting)
+- **CLAUDE.md**: Developer documentation (architecture, patterns, pitfalls)
+- **CHANGELOG.md**: Version history
+
+Always update relevant documentation when making significant changes.
+
