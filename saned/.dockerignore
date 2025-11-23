@@ -1,0 +1,8 @@
+# Ignore everything except what we need
+*
+
+# But include these files
+!Dockerfile
+!saned.conf
+!dll.conf
+

@@ -1,0 +1,16 @@
+# Environment variables - never commit secrets or local config
+# .env
+
+# Scanner output data
+scanservjs/data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

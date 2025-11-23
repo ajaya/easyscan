@@ -1,0 +1,71 @@
+services:
+  # SANE daemon for network SANE protocol
+  saned:
+    build: ./saned
+    container_name: saned
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+    environment:
+      - ALLOWED_NETWORK=${ALLOWED_NETWORK}
+      - SECONDARY_NETWORK=${SECONDARY_NETWORK:-}
+      - SANE_DEBUG_LEVEL=${SANE_DEBUG_LEVEL:-1}
+      - SANE_DEBUG_DLL=${SANE_DEBUG_LEVEL:-1}
+      - SANE_DEBUG_EPSON2=${SANE_DEBUG_LEVEL:-1}
+    healthcheck:
+      test: ["CMD", "scanimage", "-L"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # AirSane for AirScan/eSCL protocol  
+  airsane:
+    image: aguslr/airsane:latest
+    container_name: airsane
+    restart: unless-stopped
+    privileged: true
+    network_mode: host
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - ./airsane/airsane.conf:/etc/airsane/airsane.conf:ro
+    environment:
+      - AIRSANE_INTERFACE=0.0.0.0
+      - AIRSANE_PORT=${AIRSANE_PORT:-8090}
+      - AIRSANE_DEBUG=true
+      - SANE_DEBUG_DLL=${SANE_DEBUG_LEVEL:-1}
+      - SANE_DEBUG_EPSON2=${SANE_DEBUG_LEVEL:-1}
+    healthcheck:
+      test: ["CMD", "scanimage", "-L"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ScanServJS for web interface
+  scanservjs:
+    image: sbs20/scanservjs:latest
+    container_name: scanservjs  
+    restart: unless-stopped
+    privileged: true
+    ports:
+      - "${SCANSERVJS_PORT:-8080}:8080"
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb
+      - ./scanservjs/config.json:/app/config/config.json:ro
+      - ./scanservjs/data:/app/data/output
+    environment:
+      - SCANIMAGE_LIST_IGNORE=test
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}
+      - TZ=${TZ:-America/Los_Angeles}
+      - SANE_DEBUG_DLL=${SANE_DEBUG_LEVEL:-1}
+      - SANE_DEBUG_EPSON2=${SANE_DEBUG_LEVEL:-1}
+    healthcheck:
+      test: ["CMD", "scanimage", "-L"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
